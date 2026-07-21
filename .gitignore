@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.nii.gz
+*.npz
+*.pth
+*.h5
+nnUNet_raw/
+nnUNet_preprocessed/
+nnUNet_results/
