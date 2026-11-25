@@ -1,55 +1,65 @@
-# MedSAM2 Confidence-Gated Pseudo-Label Refinement for Semi-Supervised Tumor Segmentation
+# MCG-PL: Confidence-Gated Foundation-Model Refinement for Semi-Supervised Tumor Segmentation
+
+Official code for **MedSAM2 Confidence-Gated Pseudo-Label Refinement (MCG-PL)**, evaluated on
+**KiTS21** (kidney tumor) and **LiTS** (liver tumor) at 5% and 10% labeling ratios.
 
 > Paper under review.
 
-Official implementation, evaluated on **KiTS21** (kidney tumor) and **LiTS** (liver tumor) at 5% and 10% label ratios.
-
 ## Method
 
-A supervised seed model produces pseudo-labels on unlabeled scans, but systematically **under-segments** tumors. We address this in two stages:
+In low-label tumor segmentation, the dominant pseudo-label error is systematic under-segmentation of the
+tumor, not random noise. MCG-PL corrects it with a frozen medical foundation model and admits a corrected
+pseudo-label only when it can be trusted.
 
-1. **MedSAM2 tumor completion** — the under-segmented tumor is refined by prompting a frozen MedSAM2 video predictor at the densest tumor slice and propagating the mask bidirectionally along the z-axis. This recovers **+22% tumor volume** on average.
+1. **Seed model.** A 3D full-resolution nnU-Net is trained on the labeled scans and predicts organ and tumor
+   (with softmax probabilities) on the unlabeled scans.
+2. **MedSAM2 completion.** Seed tumor components are filtered (minimum size `max(200, 0.25 x largest)` voxels,
+   +/-5-slice window). Each retained component is anchored at its largest cross-section, plus further
+   anchors spread along its extent. The seed's own tumor mask on each anchor slice is used as a **mask
+   prompt** for the frozen MedSAM2 CT-lesion checkpoint, which propagates it bidirectionally through the volume.
+3. **Additive merge.** The pseudo-label keeps the seed organ. Its tumor is the union of the propagated mask and
+   the seed tumor, so no detected lesion is lost.
+4. **Confidence gate.** `c = fraction of seed-predicted tumor voxels with p_tumor > 0.9`. A pseudo-label is
+   admitted only if `c >= 0.80`.
+5. **Student.** A new nnU-Net is trained from scratch on the labeled scans and the admitted pseudo-labels.
+6. **Round two.** The student becomes the new seed and steps 1-5 are repeated. In this round, tumor components
+   that do not touch the predicted organ dilated by 3 voxels are removed from the admitted pseudo-labels
+   (organ-consistency filter). The resulting student is the final model.
 
-2. **Confidence gating** — each refined pseudo-label is scored by the fraction of predicted-tumor voxels whose tumor-class softmax probability exceeds 0.9. Only cases at or above tau = 0.80 are used for student retraining.
-
-A student nnU-Net is then trained from scratch on the labeled ground truth combined with the gated pseudo-labels.
-
-### Confidence score
-
-```
-c(y) = (1 / |Omega_t|) * SUM_{v in Omega_t}  1[ p_t(v) > 0.9 ],   Omega_t = { v : y(v) = tumor }
-```
-
-Both `p_t` and `Omega_t` are taken from the seed model f(.;theta_0); the resulting keep/discard decision is applied to the corresponding MedSAM2-refined label. A pseudo-label is kept if `c(y) >= tau = 0.80`.
-
-This is a two-threshold criterion: a voxel counts as reliable if its tumor probability exceeds 0.9, and a case is kept if at least 80% of its predicted-tumor voxels clear that bar.
-
----
+`delta = 0.9`, `tau = 0.80` and the filter are fixed for all datasets and ratios. Every design choice was
+adopted on the training pool with a decision rule fixed in advance, never on the test set.
 
 ## Repository structure
 
 ```
-nnunet_trainers/       SSL baseline trainers implemented on nnU-Net v2
-  nnUNetTrainerMeanTeacher.py   Mean Teacher (NeurIPS 2017)
-  nnUNetTrainerUAMT.py          UA-MT        (MICCAI 2019)
-  nnUNetTrainerMCNet.py         MC-Net+      (MedIA 2022)
-  nnUNetTrainerADMT.py          AD-MT        (ECCV 2024)
-  nnUNetTrainerDyCON.py         DyCON        (CVPR 2025)
-  train_launcher.py             training entry point
+mcgpl/                          final pipeline (produces the reported MCG-PL results)
+  e2e_pseudo.py                 round 1: seed inference + confidence, MedSAM2 completion, gate
+  build_union.py                round 1: additive merge (seed tumor OR propagated tumor), gate, nnU-Net dataset
+  r2.py                         round 2: round-1 student as seed; same steps, nnU-Net dataset
+  organ_check.py                pre-declared training-pool check that adopted the organ-consistency filter
+  build_oc.py                   organ-consistency filter on the round-2 pseudo-labels -> final training sets
+  build_ablation.py             KiTS21 5% ablation datasets (plain, gate only, refinement only, tau 0.70 / 0.90)
 
 pipeline/
-  1_seed_inference/      seed model inference on unlabeled scans
-  2_medsam2_refinement/  MedSAM2 tumor completion (Contribution 1)
-  3_confidence_gate/     confidence scoring and gating (Contribution 2)
-  4_dataset_builders/    assemble nnU-Net datasets for student retraining
+  2_medsam2_refinement/         MedSAM2 completion, called by the scripts above (KiTS21: gen_v2_pseudo_labels_medsam2_*,
+                                LiTS: gen_liver_medsam2_*)
+  3_confidence_gate/            confidence scoring of the original single-round runs (the seed-1 LiTS
+                                pseudo-labels and confidences reused by mcgpl/build_union.py come from these runs)
+  4_dataset_builders/           dataset builders of the original single-round runs
 
-evaluation/              Dice, Jaccard, 95HD, ASD, significance tests
-figures/                 scripts reproducing the paper figures
+baselines/samburden/            SAM-burden baseline: same frozen MedSAM2, 2D per-slice box+point prompting
+nnunet_trainers/                semi-supervised baselines implemented as nnU-Net v2 trainers
+evaluation/
+  metrics_all.py                the single metric pipeline (Dice, Jaccard, 95HD, ASD; raw and organ rule)
+  seed1_tables.py, seed1_extra.py   comparison tables and significance tests of the paper
+  significance.py               three-seed MCG-PL vs. supervised tests (Holm over the primary comparisons)
+  compute_all_metrics.py, hd95_*.py, run_significance.py   earlier evaluation scripts, superseded by the above
+figures/                        scripts for the paper figures
+legacy/                         earlier SAM2 experiments, NOT used for the reported results
 ```
 
-**Note on baselines.** Trainers for Mean Teacher, UA-MT, MC-Net+, DyCON, and AD-MT are included here. URPC and DTC were run using implementations following the original papers and the [SSL4MIS](https://github.com/HiLab-git/SSL4MIS) reference code, under the same nnU-Net backbone, data splits, and training schedule as all other methods.
-
----
+All scripts contain absolute paths from our server (`/root/autodl-tmp/...`). Set them to your own
+`nnUNet_raw`, `nnUNet_preprocessed` and `nnUNet_results` locations before running.
 
 ## Requirements
 
@@ -57,53 +67,36 @@ figures/                 scripts reproducing the paper figures
 pip install -r requirements.txt
 ```
 
-Also required: [MedSAM2](https://github.com/bowang-lab/MedSAM2) (SAM2.1-Tiny checkpoint, used frozen). Experiments were run with PyTorch 2.10 / CUDA 12.8 on a single NVIDIA RTX 5090.
+Also required: [nnU-Net v2](https://github.com/MIC-DKFZ/nnUNet) and
+[MedSAM2](https://github.com/bowang-lab/MedSAM2) (`MedSAM2_CTLesion.pt`, SAM2.1 Hiera-Tiny, 512x512 input,
+used frozen without fine-tuning). Experiments were run on a single NVIDIA RTX 5090. Every model is trained for
+250 epochs with identical nnU-Net plans per dataset.
 
----
-
-## Usage
-
-**1. Train the seed model**
-
-```bash
-python nnunet_trainers/train_launcher.py <DATASET_ID> 3d_fullres <FOLD> nnUNetTrainer_250epochs
-```
-
-**2. Generate pseudo-labels and refine with MedSAM2**
+## Usage (one setting, one seed)
 
 ```bash
-python pipeline/1_seed_inference/gen_v2_pseudo_labels_5pct.py
-python pipeline/2_medsam2_refinement/gen_liver_medsam2_5pct.py
+# round 1
+python mcgpl/e2e_pseudo.py <setting> <seed>           # seed predictions, confidence, MedSAM2 completion
+python mcgpl/build_union.py <pool> <dataset_id>        # additive merge + gate -> nnU-Net dataset
+nnUNetv2_train <dataset_id> 3d_fullres 0 -tr nnUNetTrainer_250epochs
+
+# round 2 (+ organ-consistency filter)
+python mcgpl/r2.py gpu <pool>
+python mcgpl/r2.py build <pool>
+python mcgpl/build_oc.py <pool>
+nnUNetv2_train <final_dataset_id> 3d_fullres 0 -tr nnUNetTrainer_250epochs
 ```
 
-**3. Score and gate**
+`<pool>` is one of `kits5_s1..3`, `kits10_s1..3`, `lits5_s1..3`, `lits10_s1..3`. Seeds 2 and 3 use the
+trainers `nnUNetTrainer_250epochs_seed2/3`.
 
-```bash
-python pipeline/3_confidence_gate/predict_conf_sup10.py
-```
+## Compared methods
 
-**4. Build the student dataset and retrain**
-
-```bash
-python pipeline/4_dataset_builders/build_d511_liver_ours5.py
-python nnunet_trainers/train_launcher.py 511 3d_fullres 0 nnUNetTrainer_250epochs
-```
-
-**5. Evaluate**
-
-```bash
-python evaluation/compute_all_metrics.py <TRAINER_NAME>
-```
-
----
-
-## Baselines
-
-All nine methods were trained under **identical conditions** — same nnU-Net v2 backbone, same data splits, 250 epochs, same GPU — so that differences reflect the methods themselves rather than the training setup.
+All methods use the same nnU-Net v2 backbone, plans, data splits, 250-epoch schedule and GPU.
 
 | Method | Venue |
 |---|---|
-| Supervised only | — |
+| Supervised only | - |
 | Mean Teacher | NeurIPS 2017 |
 | UA-MT | MICCAI 2019 |
 | DTC | AAAI 2021 |
@@ -111,27 +104,24 @@ All nine methods were trained under **identical conditions** — same nnU-Net v2
 | MC-Net+ | MedIA 2022 |
 | AD-MT | ECCV 2024 |
 | DyCON | CVPR 2025 |
-| **Ours** | — |
+| SAM-burden (same frozen MedSAM2, 2D per-slice prompting) | - |
+| **MCG-PL (ours)** | - |
 
----
+Trainers for Mean Teacher, UA-MT, MC-Net+, AD-MT and DyCON are in `nnunet_trainers/`. The trainer files for
+DTC and URPC were not preserved and are not included; they followed the original papers and the
+[SSL4MIS](https://github.com/HiLab-git/SSL4MIS) reference implementations.
 
 ## Data
 
-KiTS21 and LiTS are publicly available and are **not** redistributed here.
+KiTS21 and LiTS are public and are **not** redistributed here.
 
 - KiTS21: https://github.com/neheller/kits21
 - LiTS: https://competitions.codalab.org/competitions/17094
 
-Both datasets were preprocessed with the standard nnU-Net v2 pipeline.
-
----
-
 ## Acknowledgements
 
-Built on [nnU-Net v2](https://github.com/MIC-DKFZ/nnUNet) and [MedSAM2](https://github.com/bowang-lab/MedSAM2). Baseline implementations follow the original papers and, where applicable, the [SSL4MIS](https://github.com/HiLab-git/SSL4MIS) reference implementations.
-
----
+Built on [nnU-Net v2](https://github.com/MIC-DKFZ/nnUNet) and [MedSAM2](https://github.com/bowang-lab/MedSAM2).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
