@@ -1,8 +1,6 @@
 # MedSAM2 Confidence-Gated Pseudo-Label Refinement for Semi-Supervised Tumor Segmentation
 
-> **Paper:** Semi-Supervised Tumor Segmentation via MedSAM2 Confidence-Gated
-> Pseudo-Label Refinement. Under review, IEEE Transactions on Biomedical
-> Engineering (TBME), 2026.
+> Paper under review.
 
 Official implementation, evaluated on **KiTS21** (kidney tumor) and **LiTS** (liver tumor) at 5% and 10% label ratios.
 
